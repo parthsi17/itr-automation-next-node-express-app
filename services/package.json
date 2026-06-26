@@ -1,0 +1,15 @@
+{
+  "name": "itr-automationapp-services",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.1.4",
+    "express": "^4.18.2",
+    "mongoose": "^5.13.19"
+  }
+}
