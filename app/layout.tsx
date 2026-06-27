@@ -22,7 +22,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           fontSize: "1.1rem",
           letterSpacing: "-0.01em",
         }}>
-          <span>RegisterKaro · ITR Automation</span>
+          <span> ITR Automation</span>
         </header>
         {children}
       </body>

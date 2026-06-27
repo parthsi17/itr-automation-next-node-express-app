@@ -131,4 +131,5 @@ A 5-minute timeout auto-rejects stale waits so the process never leaks.
 | Separate events collection | Yes | Avoids unbounded document growth; replay queries are cheap with the compound index |
 | OTP store location | In-process Map | Bot and server run in the same Node process; a shared Map is the simplest correct design. For multi-process deployments this would move to Redis |
 | CAPTCHA handling | `page.pause()` (human-in-the-loop) | No CAPTCHA-solving API is wired up; the Playwright Inspector lets a human solve it in the headed browser |
-| Password storage | Plaintext in MongoDB result field | For this assignment credentials are stored as-is. Production would encrypt with a KMS-managed key before writing |
+| Credential storage | AES-256-GCM encrypted in `Job.result` | Credentials are encrypted with a 32-byte key (`ENCRYPTION_KEY` env var) before writing to MongoDB. The bot posts to `POST /jobs/:id/result` directly (bearer-auth, separate from the webhook) so credentials never appear in the event log. The detail endpoint decrypts before serving. |
+| Portal entry URL | `https://www.incometax.gov.in/iec/foportal/` then click Register | Navigating directly to `eportal.incometax.gov.in` returns `ERR_EMPTY_RESPONSE` — the server checks for the `www.incometax.gov.in` Referer. Clicking Register on the public portal provides that referrer naturally. |

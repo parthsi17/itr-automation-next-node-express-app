@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import Job from "../../Models/Job.js";
 import { requireBearer } from "../middleware/auth.js";
 import { resolveOtp } from "../lib/otpStore.js";
+import { encrypt, decrypt } from "../lib/encrypt.js";
 import startRun from "../../../automation/bot.js";
 
 const router = express.Router();
@@ -25,14 +26,13 @@ router.post("/jobs", requireBearer, async (req, res) => {
 
   res.set("X-Request-Id", requestId).json({ jobId });
 
-  // Fire-and-forget; errors are isolated to this run
   startRun(jobId, pan, requestId).catch(async (err) => {
     console.error(`[${requestId}] run ${jobId} crashed:`, err.message);
     await Job.findOneAndUpdate({ jobId }, { status: "FAILED", phase: "FAILED" });
   });
 });
 
-// GET /jobs — list all runs (no credential fields)
+// GET /jobs — list all runs (projection excludes result so credentials never appear here)
 router.get("/jobs", requireBearer, async (req, res) => {
   const { phase, status } = req.query;
   const filter = {};
@@ -47,11 +47,43 @@ router.get("/jobs", requireBearer, async (req, res) => {
   res.json(jobs);
 });
 
-// GET /jobs/:jobId — single run detail
+// GET /jobs/:jobId — single run detail; decrypt credentials before serving
 router.get("/jobs/:jobId", requireBearer, async (req, res) => {
   const job = await Job.findOne({ jobId: req.params.jobId });
   if (!job) return res.status(404).json({ error: "Run not found" });
-  res.json(job);
+
+  const doc = job.toObject();
+  if (doc.result?.userId) {
+    try {
+      doc.result = {
+        userId: decrypt(doc.result.userId),
+        password: decrypt(doc.result.password),
+      };
+    } catch {
+      // If decryption fails (e.g. legacy data), omit rather than expose ciphertext
+      delete doc.result;
+    }
+  }
+  res.json(doc);
+});
+
+// POST /jobs/:jobId/result — bot calls this to securely persist credentials;
+// credentials are encrypted at rest and never travel through the event log.
+router.post("/jobs/:jobId/result", requireBearer, async (req, res) => {
+  const { userId, password } = req.body;
+  if (!userId || !password) {
+    return res.status(400).json({ error: "userId and password required" });
+  }
+
+  const job = await Job.findOne({ jobId: req.params.jobId });
+  if (!job) return res.status(404).json({ error: "Run not found" });
+
+  await Job.findOneAndUpdate(
+    { jobId: req.params.jobId },
+    { result: { userId: encrypt(userId), password: encrypt(password) } }
+  );
+
+  res.json({ ok: true });
 });
 
 // POST /jobs/:jobId/otp — supply OTP from the UI
@@ -77,7 +109,6 @@ router.post("/jobs/:jobId/cancel", requireBearer, async (req, res) => {
     return res.status(409).json({ error: "Run is not in a cancellable state" });
   }
 
-  // Unblock any pending OTP wait so the bot exits cleanly
   resolveOtp(req.params.jobId, "__cancel__");
 
   const endedAt = new Date();

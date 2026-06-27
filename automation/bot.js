@@ -17,8 +17,11 @@ const S = {
   CANCELLED:        "CANCELLED",
 };
 
+// The public portal is the entry point. Navigating directly to eportal returns
+// ERR_EMPTY_RESPONSE because the server checks for the www.incometax.gov.in referrer.
 const PORTAL_URL = "https://www.incometax.gov.in/iec/foportal/";
 const MAX_CAPTCHA_RETRIES = 3;
+const MAX_OTP_ATTEMPTS = 3;
 
 // ---------------------------------------------------------------------------
 // Sequence counter (per-run, reset on each startRun call)
@@ -39,8 +42,23 @@ function maskPan(pan) {
 // ---------------------------------------------------------------------------
 export default async function startRun(jobId, pan, requestId = "") {
   _seq = 0;
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext();
+  const browser = await chromium.launch({
+    headless: false,
+    args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+  });
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+    javaScriptEnabled: true,
+    extraHTTPHeaders: {
+      "Accept-Language": "en-IN,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
   const page = await context.newPage();
 
   try {
@@ -56,7 +74,6 @@ export default async function startRun(jobId, pan, requestId = "") {
 // ---------------------------------------------------------------------------
 async function runMachine(jobId, pan, page, requestId) {
   let state = S.OPENING_PORTAL;
-  // Shared context passed between states
   const ctx = { otpAttempts: 0 };
 
   while (true) {
@@ -96,21 +113,69 @@ async function openPortal(jobId, _pan, page, requestId) {
 async function enterPan(jobId, pan, page, requestId) {
   await step(jobId, S.ENTERING_PAN, "INFO", `Entering PAN ${maskPan(pan)}`, requestId);
   try {
-    // Click "Register" to start credential generation flow
+    // Click "Register" so the browser navigates to eportal with a proper Referer header.
+    // Going directly to eportal without this referrer chain causes ERR_EMPTY_RESPONSE.
     const register = page.locator("a:has-text('Register'), button:has-text('Register')").first();
-    if (await register.isVisible({ timeout: 5_000 }).catch(() => false)) {
-      await register.click();
-      await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+    await register.waitFor({ state: "visible", timeout: 10_000 });
+    await register.click();
+
+    // Wait for the redirect to eportal to complete
+    await page.waitForURL(/eportal\.incometax\.gov\.in/, { timeout: 30_000 }).catch(() => {});
+    await page.waitForTimeout(3_000); // Angular SPA bootstrap after route change
+
+    // Portal shows a user-type selector before the PAN field — select "Individual"
+    const individualOption = page
+      .locator([
+        "label:has-text('Individual')",
+        "mat-radio-button:has-text('Individual')",
+        "input[value='INDIVIDUAL']",
+        "input[value='individual']",
+        "li:has-text('Individual')",
+        "[class*='usertype']:has-text('Individual')",
+        "div[role='radio']:has-text('Individual')",
+        "[class*='radio']:has-text('Individual')",
+        "span.mat-radio-label-content:has-text('Individual')",
+      ].join(", "))
+      .first();
+
+    if (await individualOption.isVisible({ timeout: 8_000 }).catch(() => false)) {
+      await individualOption.click();
+      await page.waitForTimeout(1_000);
+
+      const continueBtn = page
+        .locator("button:has-text('Continue'), button:has-text('Next'), button[type='submit']")
+        .first();
+      if (await continueBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
+        await continueBtn.click();
+        await page.waitForTimeout(2_000);
+      }
     }
 
     const panInput = page
-      .locator("input[name='userId'], input[placeholder*='PAN'], input[id*='pan'], input[id*='Pan']")
+      .locator([
+        "input[id='userId']",
+        "input[name='userId']",
+        "input[formcontrolname='pan']",
+        "input[formcontrolname='userId']",
+        "input[formcontrolname='panNo']",
+        "input[formcontrolname='panNumber']",
+        "input[placeholder*='PAN']",
+        "input[placeholder*='pan']",
+        "input[placeholder*='User ID']",
+        "input[placeholder*='Enter PAN']",
+        "input[id*='pan']",
+        "input[id*='Pan']",
+        "input[name='pan']",
+        "input[maxlength='10'][type='text']",
+      ].join(", "))
       .first();
-    await panInput.waitFor({ state: "visible", timeout: 10_000 });
+
+    await panInput.waitFor({ state: "visible", timeout: 20_000 });
     await panInput.fill(pan);
 
     return S.SOLVING_CAPTCHA;
   } catch (err) {
+    await page.screenshot({ path: `/tmp/pan-entry-failure-${jobId}.png`, fullPage: true }).catch(() => {});
     await step(jobId, S.FAILED, "ERROR", `PAN entry failed: ${err.message}`, requestId);
     return S.FAILED;
   }
@@ -132,7 +197,6 @@ async function solveCaptcha(jobId, _pan, page, requestId, ctx) {
   try {
     const captchaInput = page.locator("input[name='captcha'], input[id*='captcha']").first();
     if (await captchaInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
-      // Pause the Playwright Inspector for the human to fill the CAPTCHA
       await page.pause();
     }
 
@@ -145,11 +209,10 @@ async function solveCaptcha(jobId, _pan, page, requestId, ctx) {
 
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
 
-    // If the portal echoes a CAPTCHA error, retry
     const errEl = page.locator(".error, .alert-danger, [class*='error']").first();
     const errTxt = await errEl.textContent({ timeout: 3_000 }).catch(() => "");
     if (/captcha/i.test(errTxt)) {
-      await step(jobId, S.SOLVING_CAPTCHA, "WARN", `CAPTCHA incorrect, retrying`, requestId);
+      await step(jobId, S.SOLVING_CAPTCHA, "WARN", "CAPTCHA incorrect, retrying", requestId);
       return S.SOLVING_CAPTCHA;
     }
 
@@ -197,7 +260,7 @@ async function enterOtp(jobId, _pan, page, requestId, ctx) {
     const errTxt = await page.locator(".error, .alert-danger").first().textContent({ timeout: 3_000 }).catch(() => "");
     if (/otp|invalid|incorrect/i.test(errTxt)) {
       if (ctx.otpAttempts >= MAX_OTP_ATTEMPTS) {
-        await step(jobId, S.FAILED, "ERROR", `Wrong OTP × ${MAX_OTP_ATTEMPTS} — run failed`, requestId);
+        await step(jobId, S.FAILED, "ERROR", `Wrong OTP ×${MAX_OTP_ATTEMPTS} — run failed`, requestId);
         return S.FAILED;
       }
       await step(jobId, S.WAITING_OTP, "WARN", "OTP rejected — please supply the correct OTP", requestId);
@@ -233,12 +296,13 @@ async function setPassword(jobId, pan, page, requestId) {
     await submitBtn.click();
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
 
-    // PAN is the User ID on the IT portal
     const userId = pan.toUpperCase();
 
-    await step(jobId, S.SUCCESS, "INFO", "Credential generation successful", requestId, {
-      result: { userId, password },
-    });
+    // Persist credentials via the dedicated secure endpoint — never via webhook events,
+    // which are sanitised and go to the durable event log (operators can read those).
+    await persistCredentials(jobId, userId, password, requestId);
+
+    await step(jobId, S.SUCCESS, "INFO", "Credential generation successful", requestId);
     return S.SUCCESS;
   } catch (err) {
     await step(jobId, S.FAILED, "ERROR", `Password setup failed: ${err.message}`, requestId);
@@ -247,10 +311,35 @@ async function setPassword(jobId, pan, page, requestId) {
 }
 
 // ---------------------------------------------------------------------------
+// Credential persistence (direct API call, bypasses webhook sanitisation)
+// ---------------------------------------------------------------------------
+async function persistCredentials(jobId, userId, password, requestId) {
+  const base = process.env.API_URL
+    ?? process.env.EVENT_URL?.replace(/\/webhook$/, "")
+    ?? "http://localhost:5000";
+  const token = process.env.API_TOKEN;
+  if (!base || !token) {
+    console.error("[bot] API_URL / API_TOKEN not set — credentials not persisted");
+    return;
+  }
+  const res = await fetch(`${base}/jobs/${jobId}/result`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "X-Request-Id": requestId,
+    },
+    body: JSON.stringify({ userId, password }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(`[bot] Failed to persist credentials: ${res.status} ${text}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-const MAX_OTP_ATTEMPTS = 3;
-
 function generatePassword() {
   const upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ";
   const lower   = "abcdefghjkmnpqrstuvwxyz";
