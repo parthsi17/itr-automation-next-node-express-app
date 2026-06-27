@@ -1,70 +1,76 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 type Props = {
   backendUrl: string;
+  apiToken?: string;
 };
 
-export default function StartRunForm({ backendUrl }: Props) {
+export default function StartRunForm({ backendUrl, apiToken = "" }: Props) {
   const [pan, setPan] = useState("");
   const [error, setError] = useState("");
-  const [isCreating, setIsCreating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const router = useRouter();
 
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
     setError("");
-
     if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
-      setError("PAN must be in uppercase AAAAA9999A format.");
+      setError("PAN must be uppercase AAAAA9999A format.");
       return;
     }
-
-    setIsCreating(true);
-
+    setBusy(true);
     try {
-      const response = await fetch(`${backendUrl}/jobs`, {
+      const res = await fetch(`${backendUrl}/jobs`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        },
         body: JSON.stringify({ pan }),
       });
-
-      if (!response.ok) {
-        const body = await response.json();
-        throw new Error(body.error || "Unable to create run");
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? "Failed to start run");
       }
-
-      const { jobId } = await response.json();
-      window.location.href = `/runs/${jobId}`;
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Unknown error");
+      const { jobId } = await res.json();
+      router.push(`/runs/${jobId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
-      setIsCreating(false);
+      setBusy(false);
     }
-  };
+  }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form onSubmit={handleSubmit} style={{ display: "flex", gap: "0.75rem", alignItems: "flex-start", flexWrap: "wrap" }}>
       <div>
-        <label htmlFor="pan" className="block text-sm font-medium text-slate-700">
-          PAN Number
-        </label>
         <input
-          id="pan"
           type="text"
           value={pan}
-          onChange={(e) => setPan(e.target.value.toUpperCase())}
+          onChange={(e) => setPan(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
           placeholder="AAAAA9999A"
-          className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-900 shadow-sm focus:border-blue-500 focus:outline-none"
+          maxLength={10}
+          style={{
+            border: "1px solid #e2e8f0", borderRadius: 8,
+            padding: "8px 14px", fontSize: "0.95rem", outline: "none", width: 180,
+          }}
         />
+        {error && <p style={{ color: "#ef4444", fontSize: "0.8rem", marginTop: 4 }}>{error}</p>}
       </div>
-      {error ? <p className="text-sm text-red-600">{error}</p> : null}
       <button
         type="submit"
-        disabled={isCreating}
-        className="inline-flex items-center justify-center rounded-full bg-blue-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+        disabled={busy}
+        style={{
+          background: busy ? "#94a3b8" : "#f97316",
+          color: "#fff", border: "none", borderRadius: 8,
+          padding: "8px 20px", fontWeight: 700, fontSize: "0.9rem",
+          cursor: busy ? "not-allowed" : "pointer",
+        }}
       >
-        {isCreating ? "Starting run…" : "Start Run"}
+        {busy ? "Starting…" : "Start run"}
       </button>
     </form>
   );
